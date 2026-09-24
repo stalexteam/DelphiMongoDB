@@ -311,7 +311,7 @@ uses
 {$IFDEF GRIJJYLOGGING}
   Grijjy.System.Logging,
 {$ENDIF}
-  System.DateUtils, Grijjy.Bson.IO, Grijjy.Scram;
+  System.Classes, System.DateUtils, Grijjy.Bson.IO, Grijjy.Scram;
 
 var
 {$IFDEF GRIJJYLOGGING}
@@ -1508,8 +1508,15 @@ end;
 function TgoMongoProtocol.__SocketParams: string;
 begin
   if Assigned(FConnection) then
+{$IF Defined(MSWINDOWS)}
     Result := format('(Socket=%d, Connection=%d, ThreadId=%d, Pending=%s)', [FConnection.Socket, Nativeuint(FConnection),
         GetCurrentThreadId, FConnection.PendingToString])
+{$ELSE}
+    { GetCurrentThreadId and TgoSocketConnection.PendingToString only exist in the
+      Windows socket pool. }
+    Result := format('(Socket=%d, Connection=%d, ThreadId=%d)', [FConnection.Socket, Nativeuint(FConnection),
+        TThread.Current.ThreadID])
+{$ENDIF}
   else
     Result := '(No Socket)';
 end;
