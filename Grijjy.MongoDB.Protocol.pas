@@ -193,8 +193,10 @@ type
     FConnectionLock: TCriticalSection;
     FCompletedReplies: TDictionary<Integer, IgoMongoReply>;
     FPartialReplies: TDictionary<Integer, tStopWatch>;
+    { One event per outstanding request: a connection may be used by several
+      threads at the same time, and a single shared event would let one thread's
+      reply wake (and time out) another thread's request. }
     fReplyEvents: TDictionary<Integer, TEvent>;
-    fReplyEvent: TEvent; // currently only support request-response model, so need only one event
     FRepliesLock: TCriticalSection;
     FRecvBuffer: tBytes;
     FRecvSize: Integer;
@@ -477,7 +479,6 @@ begin
   FCompletedReplies := TDictionary<Integer, IgoMongoReply>.Create;
   FPartialReplies := TDictionary<Integer, tStopWatch>.Create;
   fReplyEvents := TDictionary<Integer, TEvent>.Create;
-  fReplyEvent := TEvent.Create(nil, True, False, ''); //Currently, only support request-response model
   SetLength(FRecvBuffer, RECV_BUFFER_SIZE);
   ProtocolDefaults;
 end;
@@ -522,7 +523,6 @@ begin
   FRepliesLock.Free;
   FConnectionLock.Free;
   FRecvBufferLock.Free;
-  fReplyEvent.Free;
   AtomicDecrement(NumProtocols);
   inherited;
 end;
@@ -1372,6 +1372,7 @@ var
   T: tBytes;
   paramtype: Byte;
   ExpectResponse: Boolean;
+  ReplyEvent: TEvent;
 begin
   if length(ParamType0) = 0 then
     raise EgoMongoDBError.Create('Mandatory document of PayloadType 0 missing in OpMsg');
@@ -1388,13 +1389,17 @@ begin
     else
       MsgHeader.flagbits := [];
 
+    ReplyEvent := nil;
     if ExpectResponse then
     begin
-      fReplyEvent.ResetEvent;
+      ReplyEvent := TEvent.Create(nil, True, False, '');
       FRepliesLock.Enter;
-      fReplyEvents.Add(RequestID, fReplyEvent); //register the event for this ID
-      FCompletedReplies.Remove(RequestID); // ... just in case some old response with this ID was still lingering (should not happen)
-      FRepliesLock.Leave;
+      try
+        fReplyEvents.AddOrSetValue(RequestID, ReplyEvent); //register the event for this ID
+        FCompletedReplies.Remove(RequestID); // ... just in case some old response with this ID was still lingering (should not happen)
+      finally
+        FRepliesLock.Leave;
+      end;
     end;
 
     try
@@ -1435,15 +1440,22 @@ begin
       end;
 
       if ExpectResponse then
-        Result := WaitForReply(RequestID, fReplyEvent, aTimeoutMS) //-> on timeout: socket will be destroyed + exception
+        Result := WaitForReply(RequestID, ReplyEvent, aTimeoutMS) //-> on timeout: socket will be destroyed + exception
       else
         Result := nil;
     finally
       if ExpectResponse then
       begin
+        { Unregister first: QueueReply fires the event while holding the same
+          lock, so after this the event can no longer be touched by the
+          receiving thread and it is safe to free it. }
         FRepliesLock.Enter;
-        fReplyEvents.Remove(RequestID);
-        FRepliesLock.Leave;
+        try
+          fReplyEvents.Remove(RequestID);
+        finally
+          FRepliesLock.Leave;
+        end;
+        ReplyEvent.Free;
       end;
     end;
   end
@@ -1659,11 +1671,12 @@ procedure TgoMongoProtocol.SocketRecv(const ABuffer: Pointer; const ASize: Integ
     try
       FPartialReplies.Remove(ID); //no longer needed
       FCompletedReplies.AddOrSetValue(ID, AReply); //Add the completed reply to the dictionary.
-      fReplyEvents.TryGetValue(ID, Waiter);
+      { Fire the waiter INSIDE the lock: the waiting thread frees its event right
+        after removing it from fReplyEvents under this same lock. }
+      if fReplyEvents.TryGetValue(ID, Waiter) then
+        Waiter.SetEvent;
     finally
       FRepliesLock.Release;
-      if Assigned(Waiter) then //if a tevent is waiting for this reply, fire it!
-        Waiter.SetEvent;
     end;
   end;
 
